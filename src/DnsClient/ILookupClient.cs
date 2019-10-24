@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Microsoft.Extensions.Caching.Memory;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -391,6 +392,12 @@ namespace DnsClient
                 _minimumCacheTimeout = value;
             }
         }
+
+        /// <summary>
+        /// Override MemoryCache instance
+        /// </summary>
+        [CLSCompliant(false)]
+        public IMemoryCache MemoryCache { get; set; }
 
         /// <summary>
         /// Converts the options into readonly settings.

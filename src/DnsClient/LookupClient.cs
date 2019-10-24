@@ -307,7 +307,8 @@ namespace DnsClient
         {
         }
 
-        internal LookupClient(LookupClientOptions options, DnsMessageHandler udpHandler = null, DnsMessageHandler tcpHandler = null)
+        internal LookupClient(LookupClientOptions options, DnsMessageHandler udpHandler = null,
+            DnsMessageHandler tcpHandler = null)
         {
             Settings = options ?? throw new ArgumentNullException(nameof(options));
 
@@ -319,7 +320,7 @@ namespace DnsClient
 
             _messageHandler = udpHandler ?? new DnsUdpMessageHandler(true);
             _tcpFallbackHandler = tcpHandler ?? new DnsTcpMessageHandler();
-            _cache = new ResponseCache(true, Settings.MinimumCacheTimeout);
+            _cache = new ResponseCache(true, Settings.MinimumCacheTimeout, options.MemoryCache);
         }
 
         /// <summary>
@@ -698,114 +699,108 @@ namespace DnsClient
 
             foreach (var serverInfo in servers)
             {
-                var cacheKey = string.Empty;
-                if (settings.UseCache)
-                {
-                    cacheKey = ResponseCache.GetCacheKey(request.Question, serverInfo);
-                    var item = _cache.Get(cacheKey);
-                    if (item != null)
+                var item = _cache.GetOrCreate(
+                    () => _cache.GetKey(request.Question, serverInfo),
+                    () =>
                     {
-                        return item;
-                    }
-                }
-
-                var tries = 0;
-                do
-                {
-                    tries++;
-                    lastDnsResponseException = null;
-                    lastException = null;
-
-                    try
-                    {
-                        audit?.StartTimer();
-
-                        DnsResponseMessage response = handler.Query(serverInfo.IPEndPoint, request, settings.Timeout);
-
-                        response.Audit = audit;
-
-                        if (response.Header.ResultTruncated && settings.UseTcpFallback && !handler.GetType().Equals(typeof(DnsTcpMessageHandler)))
+                        var tries = 0;
+                        do
                         {
-                            audit?.AuditTruncatedRetryTcp();
+                            tries++;
+                            lastDnsResponseException = null;
+                            lastException = null;
 
-                            return ResolveQuery(new[] { serverInfo }, settings, _tcpFallbackHandler, request, audit);
-                        }
+                            try
+                            {
+                                audit?.StartTimer();
 
-                        audit?.AuditResolveServers(servers.Count);
-                        audit?.AuditResponseHeader(response.Header);
+                                DnsResponseMessage response = handler.Query(serverInfo.IPEndPoint, request, settings.Timeout);
 
-                        if (settings.EnableAuditTrail && response.Header.ResponseCode != DnsResponseCode.NoError)
-                        {
-                            audit.AuditResponseError(response.Header.ResponseCode);
-                        }
+                                response.Audit = audit;
 
-                        HandleOptRecords(settings, audit, serverInfo, response);
+                                if (response.Header.ResultTruncated && settings.UseTcpFallback && !handler.GetType().Equals(typeof(DnsTcpMessageHandler)))
+                                {
+                                    audit?.AuditTruncatedRetryTcp();
 
-                        DnsQueryResponse queryResponse = response.AsQueryResponse(serverInfo.Clone(), settings);
+                                    return ResolveQuery(new[] { serverInfo }, settings, _tcpFallbackHandler, request, audit);
+                                }
 
-                        audit?.AuditResponse();
-                        audit?.AuditEnd(queryResponse);
+                                audit?.AuditResolveServers(servers.Count);
+                                audit?.AuditResponseHeader(response.Header);
 
-                        serverInfo.Enabled = true;
-                        serverInfo.LastSuccessfulRequest = request;
-                        lastQueryResponse = queryResponse;
+                                if (settings.EnableAuditTrail && response.Header.ResponseCode != DnsResponseCode.NoError)
+                                {
+                                    audit.AuditResponseError(response.Header.ResponseCode);
+                                }
 
-                        if (response.Header.ResponseCode != DnsResponseCode.NoError &&
-                            (settings.ThrowDnsErrors || settings.ContinueOnDnsError))
-                        {
-                            throw new DnsResponseException(response.Header.ResponseCode);
-                        }
+                                HandleOptRecords(settings, audit, serverInfo, response);
 
-                        if (settings.UseCache)
-                        {
-                            _cache.Add(cacheKey, queryResponse);
-                        }
+                                DnsQueryResponse queryResponse = response.AsQueryResponse(serverInfo.Clone(), settings);
 
-                        // TODO: trigger here?
-                        RunHealthCheck();
+                                audit?.AuditResponse();
+                                audit?.AuditEnd(queryResponse);
 
-                        return queryResponse;
-                    }
-                    catch (DnsResponseException ex)
-                    {
-                        ////audit.AuditException(ex);
-                        ex.AuditTrail = audit?.Build(null);
-                        lastDnsResponseException = ex;
+                                serverInfo.Enabled = true;
+                                serverInfo.LastSuccessfulRequest = request;
+                                lastQueryResponse = queryResponse;
 
-                        if (settings.ContinueOnDnsError)
-                        {
-                            break; // don't retry this server, response was kinda valid
-                        }
+                                if (response.Header.ResponseCode != DnsResponseCode.NoError &&
+                                    (settings.ThrowDnsErrors || settings.ContinueOnDnsError))
+                                {
+                                    throw new DnsResponseException(response.Header.ResponseCode);
+                                }
 
-                        throw ex;
-                    }
-                    catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressFamilyNotSupported)
-                    {
-                        // this socket error might indicate the server endpoint is actually bad and should be ignored in future queries.
-                        DisableServer(serverInfo);
-                        break;
-                    }
-                    catch (Exception ex) when (
-                        ex is TimeoutException
-                        || handler.IsTransientException(ex)
-                        || ex is OperationCanceledException)
-                    {
-                        DisableServer(serverInfo);
-                        continue;
-                        // retrying the same server...
-                    }
-                    catch (Exception ex)
-                    {
-                        DisableServer(serverInfo);
+                                // TODO: trigger here?
+                                RunHealthCheck();
 
-                        audit?.AuditException(ex);
+                                return queryResponse;
+                            }
+                            catch (DnsResponseException ex)
+                            {
+                                ////audit.AuditException(ex);
+                                ex.AuditTrail = audit?.Build(null);
+                                lastDnsResponseException = ex;
 
-                        lastException = ex;
+                                if (settings.ContinueOnDnsError)
+                                {
+                                    break; // don't retry this server, response was kinda valid
+                                }
 
-                        // not retrying the same server, use next or return
-                        break;
-                    }
-                } while (tries <= settings.Retries && serverInfo.Enabled);
+                                throw ex;
+                            }
+                            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressFamilyNotSupported)
+                            {
+                                // this socket error might indicate the server endpoint is actually bad and should be ignored in future queries.
+                                DisableServer(serverInfo);
+                                break;
+                            }
+                            catch (Exception ex) when (
+                                ex is TimeoutException
+                                || handler.IsTransientException(ex)
+                                || ex is OperationCanceledException)
+                            {
+                                DisableServer(serverInfo);
+                                continue;
+                                // retrying the same server...
+                            }
+                            catch (Exception ex)
+                            {
+                                DisableServer(serverInfo);
+
+                                audit?.AuditException(ex);
+
+                                lastException = ex;
+
+                                // not retrying the same server, use next or return
+                                break;
+                            }
+                        } while (tries <= settings.Retries && serverInfo.Enabled);
+
+                        return null;
+                    }, !settings.UseCache);
+
+                if (item != null)
+                    return item;
 
                 if (settings.EnableAuditTrail && servers.Count > 1 && serverInfo != servers.Last())
                 {
@@ -837,7 +832,9 @@ namespace DnsClient
             };
         }
 
-        internal async Task<IDnsQueryResponse> ResolveQueryAsync(IReadOnlyCollection<NameServer> servers, DnsQuerySettings settings, DnsMessageHandler handler, DnsRequestMessage request, LookupClientAudit continueAudit = null, CancellationToken cancellationToken = default)
+        internal async Task<IDnsQueryResponse> ResolveQueryAsync(IReadOnlyCollection<NameServer> servers,
+            DnsQuerySettings settings, DnsMessageHandler handler, DnsRequestMessage request,
+            LookupClientAudit continueAudit = null, CancellationToken cancellationToken = default)
         {
             if (request == null)
             {
@@ -860,164 +857,158 @@ namespace DnsClient
 
             foreach (var serverInfo in servers)
             {
-                var cacheKey = string.Empty;
-                if (settings.UseCache)
-                {
-                    cacheKey = ResponseCache.GetCacheKey(request.Question, serverInfo);
-                    var item = _cache.Get(cacheKey);
-                    if (item != null)
+                var item = await _cache.GetOrCreateAsync(
+                    () => _cache.GetKey(request.Question, serverInfo),
+                    async () =>
                     {
-                        return item;
-                    }
-                }
-
-                var tries = 0;
-                do
-                {
-                    tries++;
-                    lastDnsResponseException = null;
-                    lastException = null;
-
-                    try
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-
-                        audit?.StartTimer();
-
-                        DnsResponseMessage response;
-                        Action onCancel = () => { };
-                        Task<DnsResponseMessage> resultTask = handler.QueryAsync(serverInfo.IPEndPoint, request, cancellationToken, (cancel) =>
+                        var tries = 0;
+                        do
                         {
-                            onCancel = cancel;
-                        });
+                            tries++;
+                            lastDnsResponseException = null;
+                            lastException = null;
 
-                        if (settings.Timeout != System.Threading.Timeout.InfiniteTimeSpan || (cancellationToken != CancellationToken.None && cancellationToken.CanBeCanceled))
-                        {
-                            var cts = new CancellationTokenSource(settings.Timeout);
-                            CancellationTokenSource linkedCts = null;
-                            if (cancellationToken != CancellationToken.None)
+                            try
                             {
-                                linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, cancellationToken);
-                            }
-                            using (cts)
-                            using (linkedCts)
-                            {
-                                response = await resultTask.WithCancellation((linkedCts ?? cts).Token, onCancel).ConfigureAwait(false);
-                            }
-                        }
-                        else
-                        {
-                            response = await resultTask.ConfigureAwait(false);
-                        }
+                                cancellationToken.ThrowIfCancellationRequested();
 
-                        response.Audit = audit;
+                                audit?.StartTimer();
 
-                        // TODO: better way to prevent infinity looping TCP calls (remove GetType.Equals...)
-                        if (response.Header.ResultTruncated && settings.UseTcpFallback && !handler.GetType().Equals(typeof(DnsTcpMessageHandler)))
-                        {
-                            audit?.AuditTruncatedRetryTcp();
-
-                            return await ResolveQueryAsync(new[] { serverInfo }, settings, _tcpFallbackHandler, request, audit, cancellationToken).ConfigureAwait(false);
-                        }
-
-                        audit?.AuditResolveServers(servers.Count);
-                        audit?.AuditResponseHeader(response.Header);
-
-                        if (settings.EnableAuditTrail && response.Header.ResponseCode != DnsResponseCode.NoError)
-                        {
-                            audit?.AuditResponseError(response.Header.ResponseCode);
-                        }
-
-                        HandleOptRecords(settings, audit, serverInfo, response);
-
-                        DnsQueryResponse queryResponse = response.AsQueryResponse(serverInfo.Clone(), settings);
-
-                        audit?.AuditResponse();
-                        audit?.AuditEnd(queryResponse);
-
-                        // got a valid result, lets enabled the server again if it was disabled
-                        serverInfo.Enabled = true;
-                        lastQueryResponse = queryResponse;
-                        serverInfo.LastSuccessfulRequest = request;
-
-                        if (response.Header.ResponseCode != DnsResponseCode.NoError &&
-                            (settings.ThrowDnsErrors || settings.ContinueOnDnsError))
-                        {
-                            throw new DnsResponseException(response.Header.ResponseCode);
-                        }
-
-                        if (settings.UseCache)
-                        {
-                            _cache.Add(cacheKey, queryResponse);
-                        }
-
-                        // TODO: trigger here?
-                        RunHealthCheck();
-
-                        return queryResponse;
-                    }
-                    catch (DnsResponseException ex)
-                    {
-                        ex.AuditTrail = audit?.Build(null);
-                        lastDnsResponseException = ex;
-
-                        if (settings.ContinueOnDnsError)
-                        {
-                            break; // don't retry this server, response was kinda valid
-                        }
-
-                        throw;
-                    }
-                    catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressFamilyNotSupported)
-                    {
-                        // this socket error might indicate the server endpoint is actually bad and should be ignored in future queries.
-                        DisableServer(serverInfo);
-                        break;
-                    }
-                    catch (Exception ex) when (
-                        ex is TimeoutException timeoutEx
-                        || handler.IsTransientException(ex)
-                        || ex is OperationCanceledException)
-                    {
-                        // user's token got canceled, throw right away...
-                        if (cancellationToken.IsCancellationRequested)
-                        {
-                            throw new OperationCanceledException(cancellationToken);
-                        }
-
-                        DisableServer(serverInfo);
-                    }
-                    catch (Exception ex)
-                    {
-                        DisableServer(serverInfo);
-
-                        if (ex is AggregateException agg)
-                        {
-                            agg.Handle((e) =>
-                            {
-                                if (e is TimeoutException
-                                    || handler.IsTransientException(e)
-                                    || e is OperationCanceledException)
+                                DnsResponseMessage response;
+                                Action onCancel = () => { };
+                                Task<DnsResponseMessage> resultTask = handler.QueryAsync(serverInfo.IPEndPoint, request, cancellationToken, (cancel) =>
                                 {
-                                    if (cancellationToken.IsCancellationRequested)
-                                    {
-                                        throw new OperationCanceledException(cancellationToken);
-                                    }
+                                    onCancel = cancel;
+                                });
 
-                                    return true;
+                                if (settings.Timeout != System.Threading.Timeout.InfiniteTimeSpan || (cancellationToken != CancellationToken.None && cancellationToken.CanBeCanceled))
+                                {
+                                    var cts = new CancellationTokenSource(settings.Timeout);
+                                    CancellationTokenSource linkedCts = null;
+                                    if (cancellationToken != CancellationToken.None)
+                                    {
+                                        linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, cancellationToken);
+                                    }
+                                    using (cts)
+                                    using (linkedCts)
+                                    {
+                                        response = await resultTask.WithCancellation((linkedCts ?? cts).Token, onCancel).ConfigureAwait(false);
+                                    }
+                                }
+                                else
+                                {
+                                    response = await resultTask.ConfigureAwait(false);
                                 }
 
-                                return false;
-                            });
-                        }
+                                response.Audit = audit;
 
-                        audit?.AuditException(ex);
-                        lastException = ex;
+                                // TODO: better way to prevent infinity looping TCP calls (remove GetType.Equals...)
+                                if (response.Header.ResultTruncated && settings.UseTcpFallback && !handler.GetType().Equals(typeof(DnsTcpMessageHandler)))
+                                {
+                                    audit?.AuditTruncatedRetryTcp();
 
-                        // try next server (this is actually a change and is not configurable, but should be a good thing I guess)
-                        break;
-                    }
-                } while (tries <= settings.Retries && !cancellationToken.IsCancellationRequested && serverInfo.Enabled);
+                                    return await ResolveQueryAsync(new[] { serverInfo }, settings, _tcpFallbackHandler, request, audit, cancellationToken).ConfigureAwait(false);
+                                }
+
+                                audit?.AuditResolveServers(servers.Count);
+                                audit?.AuditResponseHeader(response.Header);
+
+                                if (settings.EnableAuditTrail && response.Header.ResponseCode != DnsResponseCode.NoError)
+                                {
+                                    audit?.AuditResponseError(response.Header.ResponseCode);
+                                }
+
+                                HandleOptRecords(settings, audit, serverInfo, response);
+
+                                DnsQueryResponse queryResponse = response.AsQueryResponse(serverInfo.Clone(), settings);
+
+                                audit?.AuditResponse();
+                                audit?.AuditEnd(queryResponse);
+
+                                // got a valid result, lets enabled the server again if it was disabled
+                                serverInfo.Enabled = true;
+                                lastQueryResponse = queryResponse;
+                                serverInfo.LastSuccessfulRequest = request;
+
+                                if (response.Header.ResponseCode != DnsResponseCode.NoError &&
+                                    (settings.ThrowDnsErrors || settings.ContinueOnDnsError))
+                                {
+                                    throw new DnsResponseException(response.Header.ResponseCode);
+                                }
+
+                                // TODO: trigger here?
+                                RunHealthCheck();
+
+                                return queryResponse;
+                            }
+                            catch (DnsResponseException ex)
+                            {
+                                ex.AuditTrail = audit?.Build(null);
+                                lastDnsResponseException = ex;
+
+                                if (settings.ContinueOnDnsError)
+                                {
+                                    break; // don't retry this server, response was kinda valid
+                                }
+
+                                throw;
+                            }
+                            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.AddressFamilyNotSupported)
+                            {
+                                // this socket error might indicate the server endpoint is actually bad and should be ignored in future queries.
+                                DisableServer(serverInfo);
+                                break;
+                            }
+                            catch (Exception ex) when (
+                                ex is TimeoutException timeoutEx
+                                || handler.IsTransientException(ex)
+                                || ex is OperationCanceledException)
+                            {
+                                // user's token got canceled, throw right away...
+                                if (cancellationToken.IsCancellationRequested)
+                                {
+                                    throw new OperationCanceledException(cancellationToken);
+                                }
+
+                                DisableServer(serverInfo);
+                            }
+                            catch (Exception ex)
+                            {
+                                DisableServer(serverInfo);
+
+                                if (ex is AggregateException agg)
+                                {
+                                    agg.Handle((e) =>
+                                    {
+                                        if (e is TimeoutException
+                                            || handler.IsTransientException(e)
+                                            || e is OperationCanceledException)
+                                        {
+                                            if (cancellationToken.IsCancellationRequested)
+                                            {
+                                                throw new OperationCanceledException(cancellationToken);
+                                            }
+
+                                            return true;
+                                        }
+
+                                        return false;
+                                    });
+                                }
+
+                                audit?.AuditException(ex);
+                                lastException = ex;
+
+                                // try next server (this is actually a change and is not configurable, but should be a good thing I guess)
+                                break;
+                            }
+                        } while (tries <= settings.Retries && !cancellationToken.IsCancellationRequested && serverInfo.Enabled);
+
+                        return null;
+                    }, !settings.UseCache);
+
+                if (item != null)
+                    return item;
 
                 if (settings.EnableAuditTrail && servers.Count > 1 && serverInfo != servers.Last())
                 {
