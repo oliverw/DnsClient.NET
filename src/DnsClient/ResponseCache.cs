@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.Caching.Memory;
+using NLog;
 using System;
 using System.Diagnostics;
 using System.Linq;
@@ -27,6 +28,8 @@ namespace DnsClient
                 });
             }
         }
+
+        private static ILogger logger = LogManager.GetCurrentClassLogger();
 
         private static readonly TimeSpan s_infiniteTimeout = Timeout.InfiniteTimeSpan;
 
@@ -65,7 +68,7 @@ namespace DnsClient
                 throw new ArgumentNullException(nameof(server));
             }
 
-            return string.Concat(cachePrefix, server.Address.ToString(), "#", server.Port.ToString(), "_", question.QueryName.Value, ":", (short)question.QuestionClass, ":", (short)question.QuestionType);
+            return string.Concat(cachePrefix, server.Address, "#", server.Port.ToString(), "_", question.QueryName.Value, ":", (short)question.QuestionClass, ":", (short)question.QuestionType);
         }
 
         public IDnsQueryResponse GetOrCreate(Func<string> keyFactory, Func<IDnsQueryResponse> factory, bool bypass = false)
@@ -79,7 +82,13 @@ namespace DnsClient
                 throw new ArgumentNullException(key);
 
             if (_cache.TryGetValue(key, out ResponseEntry entry))
+            {
+                logger.Debug(() => $"Cache HIT for {key.Replace(cachePrefix, string.Empty)}");
+
                 return entry.Response;
+            }
+
+            logger.Debug(() => $"Cache MISS for {key.Replace(cachePrefix, string.Empty)}");
 
             var response = factory();
 
@@ -106,7 +115,13 @@ namespace DnsClient
                 throw new ArgumentNullException(key);
 
             if (_cache.TryGetValue(key, out ResponseEntry entry))
+            {
+                logger.Debug(() => $"Cache HIT for {key.Replace(cachePrefix, string.Empty)}");
+
                 return entry.Response;
+            }
+
+            logger.Debug(() => $"Cache MISS for {key.Replace(cachePrefix, string.Empty)}");
 
             var response = await factory();
 
